@@ -102,6 +102,48 @@ def _validate_gap(data, lookup):
         raise ValidationError("gap window is required")
 
 
+ACTIVE_PLAN_STATUSES = ("planned", "running", "compensating", "compensation_failed")
+CLOSED_PLAN_STATUSES = ("succeeded", "compensated", "cancelled")
+
+
+def _validate_plan(data, lookup):
+    incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
+    if not incident or incident["status"] in ("resolved", "closed"):
+        raise ValidationError("recovery plan requires an active incident")
+    for item in _all(lookup, "recovery_plan"):
+        if item["data"].get("incident_id") == data.get("incident_id") and item["status"] in ACTIVE_PLAN_STATUSES:
+            raise ConflictError("active recovery plan already exists for incident")
+    steps = data.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValidationError("steps must be a non-empty list")
+    seen = set()
+    previous = None
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValidationError("each step must be an object")
+        step_id = step.get("step_id")
+        if not step_id or not isinstance(step_id, str):
+            raise ValidationError("step requires a step_id")
+        if step_id in seen:
+            raise ValidationError("duplicate step_id: " + step_id)
+        seen.add(step_id)
+        if not step.get("name"):
+            raise ValidationError("step requires a name")
+        depends_on = step.get("depends_on")
+        if index == 0:
+            if depends_on:
+                raise ValidationError("first step must not declare depends_on")
+        elif depends_on != previous:
+            raise ValidationError("step %s must depend on previous step %s" % (step_id, previous))
+        resources = step.get("resources") or []
+        if not isinstance(resources, list):
+            raise ValidationError("step resources must be a list")
+        for resource_id in resources:
+            if not _find_one(lookup, "*", "id", resource_id):
+                raise ValidationError("unknown shared resource: " + str(resource_id))
+        previous = step_id
+
+
 def _revise_telemetry(actor, entity, data, lookup):
     try:
         new_revision = int(data.get("revision"))
@@ -116,6 +158,9 @@ def _resolve_incident(actor, entity, data, lookup):
     actions = [a for a in _all(lookup, "recovery_action") if a["data"].get("incident_id") == entity["id"] and a["status"] not in ("succeeded", "failed", "cancelled")]
     if actions:
         raise ConflictError("incident cannot resolve while recovery actions are active")
+    plans = [p for p in _all(lookup, "recovery_plan") if p["data"].get("incident_id") == entity["id"] and p["status"] not in CLOSED_PLAN_STATUSES]
+    if plans:
+        raise ConflictError("incident cannot resolve while a recovery plan is unfinished")
     gaps = [g for g in _all(lookup, "gap") if g["data"].get("incident_id") == entity["id"] and g["status"] not in ("filled", "accepted", "closed")]
     if gaps:
         raise ConflictError("incident cannot resolve while data gaps remain open")
@@ -141,11 +186,12 @@ class RuleEngine:
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "recovery_plans": "recovery_plan", "plans": "recovery_plan",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "recovery_plan": "planned",
     }
     TRANSITIONS = {
         "station": {
@@ -206,6 +252,7 @@ class RuleEngine:
         "telemetry": ("asset_id", "metric", "value", "observed_at", "revision"),
         "incident": ("kind", "severity", "summary"),
         "recovery_action": ("incident_id", "action_type", "dedupe_key"),
+        "recovery_plan": ("incident_id", "steps"),
         "mission": ("station_id", "purpose", "window_start", "window_end"),
         "gap": ("incident_id", "start_at", "end_at"),
     }
@@ -225,6 +272,7 @@ class RuleEngine:
         "telemetry": ("admin", "operator", "engineer"),
         "incident": ("admin", "operator", "engineer"),
         "recovery_action": ("admin", "operator", "engineer"),
+        "recovery_plan": ("admin", "operator", "engineer"),
         "mission": ("admin", "engineer"),
         "gap": ("admin", "operator", "engineer"),
     }
@@ -262,6 +310,7 @@ class RuleEngine:
         "telemetry": lambda a, d, l: _validate_telemetry(d, l),
         "incident": lambda a, d, l: _validate_incident(d, l),
         "recovery_action": lambda a, d, l: _validate_action(d, l),
+        "recovery_plan": lambda a, d, l: _validate_plan(d, l),
         "mission": lambda a, d, l: _validate_mission(d, l),
         "gap": lambda a, d, l: _validate_gap(d, l),
     }

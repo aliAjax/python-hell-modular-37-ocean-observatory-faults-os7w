@@ -7,5 +7,7 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre></main>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/recovery_plans        提交恢复处理链（每步登记 depends_on 与 resources）
+GET  /api/resources/&lt;id&gt;/holds  共享资源引用计数与持有方</pre></main>
 <script>async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>

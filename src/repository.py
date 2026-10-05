@@ -54,6 +54,22 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS recovery_plan_guard (
+                    incident_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS resource_hold (
+                    plan_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'held',
+                    acquired_at TEXT NOT NULL,
+                    released_at TEXT,
+                    PRIMARY KEY(plan_id, step_id, resource_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_resource_hold_resource
+                    ON resource_hold(resource_id, status);
             """)
 
     @staticmethod
@@ -79,6 +95,117 @@ class SQLiteRepository:
                 (entity_id, kind, status, payload, actor_id, now, now),
             )
         return self.get_entity(entity_id)
+
+    def create_plan(self, entity_id, incident_id, status, data, actor_id):
+        """Insert a recovery plan and its per-incident guard row atomically.
+
+        The guard row enforces first-write-wins: a concurrent submission for the
+        same incident fails on the PRIMARY KEY instead of silently duplicating.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT INTO recovery_plan_guard(incident_id, plan_id, created_at) VALUES (?, ?, ?)",
+                    (incident_id, entity_id, now),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError(
+                    "active recovery plan already exists for incident: " + incident_id
+                )
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'recovery_plan', ?, 1, ?, ?, ?, ?)",
+                (entity_id, status, payload, actor_id, now, now),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
+    def mutate_plan(self, plan_id, expected_version, status, data, acquire=(), release_steps=(), release_guard=False):
+        """Update a plan entity and adjust resource holds in one transaction.
+
+        acquire: iterable of (step_id, resource_id) to hold (idempotent).
+        release_steps: iterable of step ids whose held holds are released;
+        already-released holds are untouched, so repeated compensation cannot
+        release a resource twice.
+        Returns (entity, acquired_resource_ids, released_resource_ids).
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        acquired = []
+        released = []
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version FROM entities WHERE id = ?", (plan_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + plan_id)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (status, payload, now, plan_id, current_version),
+            )
+            for step_id, resource_id in acquire:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO resource_hold(plan_id, step_id, resource_id, status, acquired_at) "
+                    "VALUES (?, ?, ?, 'held', ?)",
+                    (plan_id, step_id, resource_id, now),
+                )
+                if cursor.rowcount:
+                    acquired.append(resource_id)
+            for step_id in release_steps:
+                rows = connection.execute(
+                    "SELECT resource_id FROM resource_hold "
+                    "WHERE plan_id = ? AND step_id = ? AND status = 'held'",
+                    (plan_id, step_id),
+                ).fetchall()
+                if rows:
+                    connection.execute(
+                        "UPDATE resource_hold SET status = 'released', released_at = ? "
+                        "WHERE plan_id = ? AND step_id = ? AND status = 'held'",
+                        (now, plan_id, step_id),
+                    )
+                    released.extend(row["resource_id"] for row in rows)
+            if release_guard:
+                connection.execute(
+                    "DELETE FROM recovery_plan_guard WHERE incident_id = ? AND plan_id = ?",
+                    (data.get("incident_id"), plan_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(plan_id), acquired, released
+
+    def resource_holders(self, resource_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT plan_id, step_id, acquired_at FROM resource_hold "
+                "WHERE resource_id = ? AND status = 'held' ORDER BY acquired_at, plan_id",
+                (resource_id,),
+            ).fetchall()
+        return [
+            {"plan_id": row["plan_id"], "step_id": row["step_id"], "acquired_at": row["acquired_at"]}
+            for row in rows
+        ]
 
     def get_entity(self, entity_id):
         with self._connect() as connection:

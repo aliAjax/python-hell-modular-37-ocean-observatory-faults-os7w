@@ -86,6 +86,8 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "resources" and parts[3] == "holds":
+                    return self._send(200, service.resource_status(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))

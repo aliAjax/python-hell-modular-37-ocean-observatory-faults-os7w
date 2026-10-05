@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .recovery import RecoveryPlanService
 from .rules import RuleEngine
 
 
@@ -11,8 +12,16 @@ class DomainService:
         self.repository = repository
         self.rules = rules or RuleEngine()
         self.audit = AuditTrail(repository)
+        self.recovery = RecoveryPlanService(repository, self.audit)
 
     def _lookup(self, kind, field, value):
+        if kind in ("*", None):
+            entities = self.repository.list_entities()
+            if field == "id":
+                return [entity for entity in entities if entity["id"] == value]
+            if field == "*":
+                return entities
+            return [entity for entity in entities if entity["data"].get(field) == value]
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
 
     def health(self):
@@ -32,7 +41,10 @@ class DomainService:
         if self.repository.get_entity(entity_id):
             raise ConflictError("entity already exists: " + entity_id)
         status = self.rules.initial_status(kind, payload)
-        entity = self.repository.create_entity(entity_id, kind, status, payload, actor.user_id)
+        if kind == "recovery_plan":
+            entity = self.recovery.create_plan(actor, entity_id, payload, status)
+        else:
+            entity = self.repository.create_entity(entity_id, kind, status, payload, actor.user_id)
         self.audit.record(entity_id, actor, "create", None, status, {"kind": kind})
         if idempotency_key:
             self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
@@ -42,6 +54,10 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        if entity["kind"] == "recovery_plan":
+            return self.recovery.handle_action(
+                actor, entity, action, dict(data or {}), expected_version
+            )
         expected = int(expected_version) if expected_version is not None else entity["version"]
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
@@ -95,6 +111,9 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         return entity
+
+    def resource_status(self, resource_id):
+        return self.recovery.resource_status(resource_id)
 
     def list(self, kind=None, status=None):
         if kind:
