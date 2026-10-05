@@ -102,6 +102,72 @@ def _validate_gap(data, lookup):
         raise ValidationError("gap window is required")
 
 
+RECOVERY_TARGET_KINDS = ("asset", "link", "mission")
+RECOVERY_FORWARD_ACTIONS = {
+    "asset": ("start_reboot",),
+    "link": ("activate_backup",),
+    "mission": ("depart",),
+}
+RECOVERY_COMPENSATION_ACTIONS = {
+    "asset": ("abort_reboot",),
+    "link": ("restore",),
+    "mission": ("cancel",),
+}
+
+
+def _validate_chain(actor, data, lookup):
+    incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
+    if not incident or incident["status"] in ("resolved", "closed"):
+        raise ValidationError("recovery chain requires an active incident")
+    steps = data.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValidationError("recovery chain requires non-empty steps")
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValidationError("step must be an object")
+        if not step.get("name"):
+            raise ValidationError("step name is required")
+        target = step.get("target") or {}
+        kind = target.get("kind")
+        target_id = target.get("id")
+        if kind not in RECOVERY_TARGET_KINDS:
+            raise ValidationError("step target must be asset, link or mission")
+        if not target_id:
+            raise ValidationError("step target id is required")
+        if not _find_one(lookup, kind, "id", target_id):
+            raise ValidationError("step target not found: " + str(target_id))
+        action = step.get("action")
+        compensation = step.get("compensation")
+        if action not in RECOVERY_FORWARD_ACTIONS[kind]:
+            raise ValidationError("forward action %s is not allowed for %s" % (action, kind))
+        if compensation not in RECOVERY_COMPENSATION_ACTIONS[kind]:
+            raise ValidationError("compensation %s is not allowed for %s" % (compensation, kind))
+        forward = RuleEngine.TRANSITIONS[kind][action]
+        reverse = RuleEngine.TRANSITIONS[kind][compensation]
+        if forward[1] not in reverse[0]:
+            raise ValidationError("compensation %s cannot roll back %s" % (compensation, action))
+        depends = step.get("depends_on")
+        if index == 0:
+            if depends is not None:
+                raise ValidationError("first step cannot depend on a previous step")
+        elif depends != index - 1:
+            raise ValidationError("step must depend on the immediately previous step")
+        resources = step.get("resources") or []
+        if not isinstance(resources, list):
+            raise ValidationError("step resources must be a list")
+        for resource in resources:
+            if not isinstance(resource, dict):
+                raise ValidationError("resource must be an object")
+            if not resource.get("type") or not resource.get("key"):
+                raise ValidationError("resource type and key are required")
+            try:
+                units = int(resource.get("units"))
+            except (TypeError, ValueError):
+                raise ValidationError("resource units must be an integer")
+            if units < 1:
+                raise ValidationError("resource units must be positive")
+
+
 def _revise_telemetry(actor, entity, data, lookup):
     try:
         new_revision = int(data.get("revision"))
@@ -119,9 +185,15 @@ def _resolve_incident(actor, entity, data, lookup):
     gaps = [g for g in _all(lookup, "gap") if g["data"].get("incident_id") == entity["id"] and g["status"] not in ("filled", "accepted", "closed")]
     if gaps:
         raise ConflictError("incident cannot resolve while data gaps remain open")
-    assets = [a for a in _all(lookup, "asset") if a["status"] in ("faulty", "offline", "rebooting")]
-    if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
-        raise ConflictError("affected asset is still unavailable")
+    chains = [c for c in _all(lookup, "recovery_chain") if c["data"].get("incident_id") == entity["id"]]
+    chain_succeeded = any(c["status"] == "succeeded" for c in chains)
+    for chain in chains:
+        if chain["status"] not in ("succeeded", "compensated"):
+            raise ConflictError("recovery chain is not complete (status: %s)" % chain["status"])
+    if not chain_succeeded:
+        assets = [a for a in _all(lookup, "asset") if a["status"] in ("faulty", "offline", "rebooting")]
+        if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
+            raise ConflictError("affected asset is still unavailable")
     return {"resolved_by": actor.user_id}
 
 
@@ -141,11 +213,12 @@ class RuleEngine:
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "recovery_chains": "recovery_chain",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "recovery_chain": "running",
     }
     TRANSITIONS = {
         "station": {
@@ -157,6 +230,7 @@ class RuleEngine:
             "degrade": (("healthy",), "degraded"),
             "fail": (("healthy", "degraded"), "faulty"),
             "start_reboot": (("faulty",), "rebooting"),
+            "abort_reboot": (("rebooting",), "faulty"),
             "finish_reboot": (("rebooting",), "healthy"),
             "restore": (("faulty",), "healthy"),
         },
@@ -208,6 +282,7 @@ class RuleEngine:
         "recovery_action": ("incident_id", "action_type", "dedupe_key"),
         "mission": ("station_id", "purpose", "window_start", "window_end"),
         "gap": ("incident_id", "start_at", "end_at"),
+        "recovery_chain": ("incident_id", "steps"),
     }
     ACTION_REQUIRED = {
         ("station", "degrade"): ("reason",),
@@ -227,6 +302,7 @@ class RuleEngine:
         "recovery_action": ("admin", "operator", "engineer"),
         "mission": ("admin", "engineer"),
         "gap": ("admin", "operator", "engineer"),
+        "recovery_chain": ("admin", "engineer", "operator"),
     }
     ROLE_ACTIONS = {
         "degrade": ("admin", "engineer", "operator"),
@@ -234,6 +310,7 @@ class RuleEngine:
         "resume": ("admin", "engineer", "operator"),
         "fail": ("admin", "engineer", "operator"),
         "start_reboot": ("admin", "engineer", "operator"),
+        "abort_reboot": ("admin", "engineer", "operator"),
         "finish_reboot": ("admin", "engineer", "operator"),
         "restore": ("admin", "engineer", "operator"),
         "activate_backup": ("admin", "engineer", "operator"),
@@ -264,6 +341,7 @@ class RuleEngine:
         "recovery_action": lambda a, d, l: _validate_action(d, l),
         "mission": lambda a, d, l: _validate_mission(d, l),
         "gap": lambda a, d, l: _validate_gap(d, l),
+        "recovery_chain": lambda a, d, l: _validate_chain(a, d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,

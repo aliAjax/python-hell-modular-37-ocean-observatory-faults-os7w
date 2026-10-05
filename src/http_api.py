@@ -18,7 +18,7 @@ def _json_bytes(payload):
     return json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
 
 
-def create_handler(service, rules, static_dir):
+def create_handler(service, rules, static_dir, recovery=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "ModularPython/1.0"
 
@@ -86,6 +86,14 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if recovery and len(parts) == 2 and parts == ["api", "recovery-chains"]:
+                    query = parse_qs(parsed.query)
+                    incident_id = query.get("incident_id", [None])[0]
+                    return self._send(200, {"items": recovery.list_chains(incident_id=incident_id)})
+                if recovery and len(parts) == 3 and parts[:2] == ["api", "recovery-chains"]:
+                    return self._send(200, recovery.get_chain(parts[2]))
+                if recovery and len(parts) == 2 and parts == ["api", "recovery-resources"]:
+                    return self._send(200, {"items": service.repository.list_resources()})
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
@@ -129,6 +137,32 @@ def create_handler(service, rules, static_dir):
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     return self._send(200, service.transition(actor, parts[2], parts[3], self._body(), None))
+                if recovery and len(parts) == 2 and parts == ["api", "recovery-chains"]:
+                    body = self._body()
+                    idem = self.headers.get("Idempotency-Key")
+                    return self._send(
+                        201,
+                        recovery.submit_chain(
+                            actor,
+                            body.get("incident_id"),
+                            body.get("steps"),
+                            idem,
+                        ),
+                    )
+                if recovery and len(parts) == 4 and parts[:2] == ["api", "recovery-chains"] and parts[3] == "execute":
+                    return self._send(200, recovery.execute_chain(parts[2]))
+                if recovery and len(parts) == 4 and parts[:2] == ["api", "recovery-chains"] and parts[3] == "resume":
+                    return self._send(200, recovery.resume_chain(parts[2]))
+                if recovery and len(parts) == 2 and parts == ["api", "recovery-resources"]:
+                    body = self._body()
+                    return self._send(
+                        201,
+                        service.repository.register_resource(
+                            body.get("resource_type"),
+                            body.get("resource_key"),
+                            body.get("capacity"),
+                        ),
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
@@ -140,6 +174,6 @@ def create_handler(service, rules, static_dir):
     return Handler
 
 
-def create_server(host, port, service, rules, static_dir):
-    handler = create_handler(service, rules, static_dir)
+def create_server(host, port, service, rules, static_dir, recovery=None):
+    handler = create_handler(service, rules, static_dir, recovery)
     return ThreadingHTTPServer((host, int(port)), handler)
